@@ -37,6 +37,9 @@ use std::{
 
 use anyhow::{Context, Error};
 
+#[cfg(unix)]
+use tokio::io::AsyncReadExt;
+
 use crossterm::{
     event::{
         DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
@@ -83,6 +86,9 @@ pub struct Application {
     jobs: Jobs,
     lsp_progress: LspProgressMap,
     last_render: Instant,
+
+    #[cfg(unix)]
+    remote_listener: tokio_stream::wrappers::UnixListenerStream,
 }
 
 #[cfg(feature = "integration")]
@@ -254,6 +260,12 @@ impl Application {
         let signals = Signals::new([signal::SIGTSTP, signal::SIGCONT, signal::SIGUSR1])
             .context("build signal handler")?;
 
+        #[cfg(unix)]
+        let remote_listener = {
+            let listener = tokio::net::UnixListener::bind("/tmp/helix-socket").unwrap();
+            tokio_stream::wrappers::UnixListenerStream::new(listener)
+        };
+
         let app = Self {
             compositor,
             terminal,
@@ -268,6 +280,9 @@ impl Application {
             jobs: Jobs::new(),
             lsp_progress: LspProgressMap::new(),
             last_render: Instant::now(),
+
+            #[cfg(unix)]
+            remote_listener,
         };
 
         Ok(app)
@@ -345,6 +360,9 @@ impl Application {
                 Some(signal) = self.signals.next() => {
                     self.handle_signals(signal).await;
                 }
+                Some(result) = self.remote_listener.next() => {
+                    self.handle_remote(result).await;
+                }
                 Some(callback) = self.jobs.futures.next() => {
                     self.jobs.handle_callback(&mut self.editor, &mut self.compositor, callback);
                     self.render().await;
@@ -371,6 +389,43 @@ impl Application {
             {
                 self.editor.reset_idle_timer();
             }
+        }
+    }
+
+    // Handles text messages coming in from a unix socket - currently only used to respond to
+    // 'open file' requests so that we can do that from the command line
+    pub async fn handle_remote(&mut self, result: Result<tokio::net::UnixStream, std::io::Error>) {
+        match result {
+            Ok(mut unix_stream) => {
+                let mut buffer = Vec::new();
+                let _ = unix_stream.read_to_end(&mut buffer).await;
+
+                let contents = String::from_utf8_lossy(&buffer);
+
+                let parts: Vec<_> = contents.split(' ').collect();
+                if parts[0] == "open" {
+                    let file_path = parts[1];
+                    let command = crate::commands::MappableCommand::Typable {
+                        name: "open".to_string(),
+                        args: vec![file_path.trim().to_string()],
+                        doc: String::new(),
+                    };
+
+                    let mut context = crate::commands::Context {
+                        editor: &mut self.editor,
+                        count: None,
+                        register: None,
+                        callback: None,
+                        on_next_key_callback: None,
+                        jobs: &mut self.jobs,
+                    };
+
+                    command.execute(&mut context);
+
+                    self.render().await;
+                }
+            }
+            _ => {}
         }
     }
 
